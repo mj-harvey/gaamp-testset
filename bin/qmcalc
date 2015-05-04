@@ -1,0 +1,182 @@
+#!/usr/bin/perl  -w
+
+use strict;
+use File::Path;
+
+my $input="input.xyz";
+my $output="output.xyz";
+my $frozen=0;
+my $opt=0;
+my $basis="6-31g*";
+my $theory="hf";
+chomp(my $ncpus = `cat /proc/cpuinfo | grep -c -P '^processor\\s+:'`);
+my $mem=2;
+my $code="psi4";
+my $grid=0;
+my $cache=0;
+my $cachedirroot="../cachedir/";
+
+
+my $psi4 = "psi4";
+my $gaussian = "g09";
+
+do_arg_parse();
+
+chomp( my $babel=`which babel` );
+
+if ( ! -x $babel ) {
+	print "Can't find babel executable\n"
+	exit 1;
+}
+if( ! -e $xyz ) {
+	print "$xyz not found\n";
+	exit 1;
+}
+
+my $cached_result = 0;
+my $cached_entry  = undef;
+
+($cached_result, $cached_entry ) = look_for_match( $cachedir, $xyz );
+
+if( $cached_result ) {
+	if( -e "$cached_entry/output.xyz" ) {
+		`cp $cached_entry/output.xyz $output`;
+	}
+}
+else {
+	my $ret = make_input( "$cached_entry/input.dat" );
+	if( ! $ret ) {
+		deltree( $cached_entry );
+		print "Failed to generate input\n";
+		exit(1);
+	}
+	else {
+		# TODO: Run simulation
+		chdir( $cached_entry );
+		if( $code eq "psi4" ) {
+			`$psi4 -i input.dat -o output.dat`;
+		}
+		elsif( $code eq "gaussian" ) {
+			`$gaussian < input.dat > output.dat`;
+			# TODO: make output.xyz from output.dat
+		}
+	}
+}
+
+
+
+
+
+exit 0;
+
+sub find_cached_match {
+	my $cachedir = shift;
+	my $input    = shift;
+
+	my $found    = -1;
+	my $rmsdlimit= 0.1;
+
+	my $i=0;
+	while( -d "$cachedir/$i" && -e "$cachedir/$i/input.xyz" ) {
+		my $rmsd = get_rmsd( $input, "$cachedir/$i/input.xyz" );
+		if( defined($rmsd) && $rmsd >= 0.  && $rmsd < $rmsdlimit ) {
+			$found      = $i;
+			$rsmdlimit  = $rmsd; 
+		}
+		$i++;
+	}
+	if( $found == -1 ) { 
+		`mkdir $cachedir/$i`;
+		 my $ff = "$cachedir/$i/input.xyz";
+		`cp $input $ff`;
+		return ( 0, "$cachedir/$i" );
+	}	
+	else {
+		return( 1, "$cachedir/$found" );
+	}
+}
+
+sub rmsd {
+	# a dummy rmsd that just comapres md5 hashes
+
+	my $file1 = shift;
+	my $file2 = shift;
+
+	my $md51 = `cat $file1 | md5sum`;
+	my $md52 = `cat $file2 | md5sum`;
+
+	if( $md51 eq $md52 ) { return 0.; }
+	else { return -1- };
+}
+
+sub make_input {
+	my $file = shift;
+	my $cmd = "$babel -i xyz $xyz -o ${code}in $file -xT $theory -xB $basis -xm $mem -xn $ncpus ";
+	if( $frozen != 0 ) { $str = "$str -xF $frozen "; }
+	if( $opt != 0    ) { $str = "$str -xO normal  "; }
+	`$cmd`;
+	if( ! -e $file ) {
+		return 0;		
+	}
+
+	return $file;
+}
+
+sub get_cache_dir {
+	my $inchikey = get_inchikey();
+	my $str="$cachedirroot/$inchikey/$code-$theory-$basis-$opt-$frozen-$grid";
+	mkpath($cachedir);
+	return $str;
+}
+
+sub get_inchikey {
+	return `$babel -i xyz $xyz -o inchikey -  2> /dev/null | head -1`;
+
+}
+sub do_arg_parse {
+
+for( my $i=0; $i < scalar(@ARGV); $i++ ) {
+	if( $i eq "-h" || $i eq "--help" ) { do_syntax(); }
+	if( $i eq "--input"  ) { $input  = $ARGV[$i+1]; $i++; }		
+	if( $i eq "--output" ) { $output = $ARGV[$i+1]; $i++; }		
+	if( $i eq "--code"   ) { $code   = $ARGV[$i+1]; $i++; }		
+	if( $i eq "--theory" ) { $theory = $ARGV[$i+1]; $i++; }		
+	if( $i eq "--opt" )    { $opt    = 1; }		
+	if( $i eq "--basis" )  { $basis  = $ARGV[$i+1]; $i++; }		
+	if( $i eq "--grid" )   { $grid   = $ARGV[$i+1]; $i++; }		
+	if( $i eq "--frozen" ) { $frozen = $ARGV[$i+1]; $i++; }		
+	if( $i eq "--ncpus"  ) { $ncpus  = $ARGV[$i+1]; $i++; }		
+	if( $i eq "--mem"   )  { $mem    = $ARGV[$i+1]; $i++; }		
+	if( $i eq "--cache" )  { $cache  = 1; }
+	else {
+			print "Unknown argument $i\n\n";
+			exit(1);
+	}
+}
+
+}
+
+
+
+sub do_syntax {
+	print "
+  Options:
+    --input  [file]     Input molecule in XYZ format     (default $xyz)
+    --code   arg1       QM code to use: gaussian, psi4   (default $code)
+    --theory arg1       Theory level: b3lyp, rhf, uhf    (default $theory)   
+    --opt               Specify to optimise, otherwise single-point               
+    --basis  arg1       Basis set: 6-31g*, cc-pvdz       (default $basis)
+    --grid   [file]     List of grid points to evaluate  (default [none])
+    --frozen arg1       List of bonds, angle, dihedrals to freeze
+                          Atoms indexed from 1, comma-separated.
+                          Each term colon-separated.
+                          Eg freezing one angle, one dihedral: 
+                            --frozen 1,2,3:3,5,6,7
+    --ncpus #           # of CPUS to use                 (default $ncpus)
+    --mem   #           GB of memory to use              (default 2)
+    --cache             Specify to check for cached result
+   
+";
+	exit 0;
+}
+
