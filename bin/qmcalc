@@ -1,67 +1,91 @@
 #!/usr/bin/perl  -w
 
 use strict;
-use File::Path;
+use File::Path qw/make_path remove_tree/;
+use File::Copy qw/cp/;
+use FindBin qw($RealBin);
+use Cwd;
+use Data::Dumper;
 
 my $input="input.xyz";
 my $output="output.xyz";
 my $frozen=0;
 my $opt=0;
 my $basis="6-31g*";
-my $theory="hf";
+my $theory="rhf";
 chomp(my $ncpus = `cat /proc/cpuinfo | grep -c -P '^processor\\s+:'`);
 my $mem=2;
 my $code="psi4";
 my $grid=0;
 my $cache=0;
-my $cachedirroot="../cachedir/";
+my $charge=0;
+my $mult=1;
+my $verbose = 0;
+
+my $cachedirroot="$RealBin/../cachedir/";
+my $bindir=$RealBin;
+
+make_path( $cachedirroot );
+
+my $codes = {
+	"psi4"    => find_bin("psi4"),
+	"gaussian"=> find_bin("g09")
+};
 
 
-my $psi4 = "psi4";
-my $gaussian = "g09";
+
+
 
 do_arg_parse();
 
-chomp( my $babel=`which babel` );
+my $babel  = "$bindir/babel";
 
 if ( ! -x $babel ) {
-	print "Can't find babel executable\n"
+	print "Can't find babel executable\n";
 	exit 1;
 }
-if( ! -e $xyz ) {
-	print "$xyz not found\n";
+if( ! -e $input ) {
+	print "$input not found\n";
 	exit 1;
 }
 
 my $cached_result = 0;
 my $cached_entry  = undef;
 
-($cached_result, $cached_entry ) = look_for_match( $cachedir, $xyz );
+($cached_result, $cached_entry ) = find_cached_match( );
 
-if( $cached_result ) {
-	if( -e "$cached_entry/output.xyz" ) {
-		`cp $cached_entry/output.xyz $output`;
-	}
+# Now we have in $cached_entry a working dir containing 
+# at least input.xyz that is within the RSMD threshold of the input
+# It might also contain an output.xyz
+# If so, return that back to $output and finish
+
+if( -e "$cached_entry/output.xyz" ) {
+	if( $verbose ) { print "-- Returning cached result\n"; }
+	cp( "$cached_entry/output.xyz", $output ) or error( "Cant stage cached output file" );
+
+	exit(0);  # Done successfully!
 }
-else {
+
+	# Otherwise, make an input file appropriate for the code
 	my $ret = make_input( "$cached_entry/input.dat" );
 	if( ! $ret ) {
-		deltree( $cached_entry );
-		print "Failed to generate input\n";
+		print "Failed to generate input for QM code!\n";
 		exit(1);
 	}
 	else {
 		# TODO: Run simulation
+		my $dir = getcwd();
 		chdir( $cached_entry );
-		if( $code eq "psi4" ) {
-			`$psi4 -i input.dat -o output.dat`;
-		}
-		elsif( $code eq "gaussian" ) {
-			`$gaussian < input.dat > output.dat`;
-			# TODO: make output.xyz from output.dat
-		}
+		if( $verbose ) { print ("-- Running QM Code $code\n"); }
+
+		if ( !defined(  ${$codes}{$code} ) || ! -x ${$codes}{$code} ) { error( "Binary for QM code $code not found" ); }
+		eval( "run_$code();" );
+
+		chdir( $dir );
+		if( ! -e "$cached_entry/output.xyz" ) { error( "QM calculation failed!\n" ); exit(1); }
+		cp( "$cached_entry/output.xyz", $output );
+		exit(0);
 	}
-}
 
 
 
@@ -70,33 +94,39 @@ else {
 exit 0;
 
 sub find_cached_match {
-	my $cachedir = shift;
-	my $input    = shift;
 
 	my $found    = -1;
 	my $rmsdlimit= 0.1;
 
+	my $cachedir = get_cache_dir();
+
 	my $i=0;
 	while( -d "$cachedir/$i" && -e "$cachedir/$i/input.xyz" ) {
+		if( $verbose ) { print "  -- Checking entry $i\n" ; }
 		my $rmsd = get_rmsd( $input, "$cachedir/$i/input.xyz" );
 		if( defined($rmsd) && $rmsd >= 0.  && $rmsd < $rmsdlimit ) {
 			$found      = $i;
-			$rsmdlimit  = $rmsd; 
+			$rmsdlimit  = $rmsd; 
 		}
 		$i++;
 	}
+	
 	if( $found == -1 ) { 
-		`mkdir $cachedir/$i`;
-		 my $ff = "$cachedir/$i/input.xyz";
-		`cp $input $ff`;
-		return ( 0, "$cachedir/$i" );
+		my $ret="$cachedir/$i";	
+		make_path( $ret , {  mode=>0700 });
+		if( ! -d $ret ) { error( "Failed to make cachedir $ret"); }
+		 my $ff = "$ret/input.xyz";
+		cp( $input, $ff) or die "Cant copy $input to $ff";
+		if( $verbose) { print "-- Creating new cache entry $i\n"; }
+		return ( 0, $ret );
 	}	
 	else {
+		if( $verbose) { print "-- Using existing cache entry $found\n" };
 		return( 1, "$cachedir/$found" );
 	}
 }
 
-sub rmsd {
+sub get_rmsd {
 	# a dummy rmsd that just comapres md5 hashes
 
 	my $file1 = shift;
@@ -106,16 +136,19 @@ sub rmsd {
 	my $md52 = `cat $file2 | md5sum`;
 
 	if( $md51 eq $md52 ) { return 0.; }
-	else { return -1- };
+	else { return -1; };
 }
 
 sub make_input {
 	my $file = shift;
-	my $cmd = "$babel -i xyz $xyz -o ${code}in $file -xT $theory -xB $basis -xm $mem -xn $ncpus ";
-	if( $frozen != 0 ) { $str = "$str -xF $frozen "; }
-	if( $opt != 0    ) { $str = "$str -xO normal  "; }
-	`$cmd`;
+	my $cmd = "$babel -i xyz '$input' -o ${code}in '$file' -xT '$theory' -xB '$basis'  -xQ '$charge' -xm '$mem' -xp '$ncpus' ";
+	if( $frozen != 0 ) { $cmd = "$cmd -xF '$frozen' "; }
+	if( $opt != 0    ) { $cmd = "$cmd -xO normal  "; }
+	my $op=`$cmd 2> /dev/null`;
 	if( ! -e $file ) {
+		print "ERROR\n$cmd\n";
+		print "$file\n";
+		print "$op\n";
 		return 0;		
 	}
 
@@ -124,32 +157,47 @@ sub make_input {
 
 sub get_cache_dir {
 	my $inchikey = get_inchikey();
-	my $str="$cachedirroot/$inchikey/$code-$theory-$basis-$opt-$frozen-$grid";
-	mkpath($cachedir);
+	my $basis_fn = $basis;
+	$basis_fn =~ s/\*/star/g;
+	my $str="$inchikey/$code/$theory-$basis_fn/$opt-$frozen-$grid-$mult-$charge";
+	if( $verbose) { print "-- Cache root is $cachedirroot\n"; }
+	if( $verbose) { print "-- Cache dir  is $str\n"; }
+	$str = "$cachedirroot/$str";
+	make_path( "$str ");
 	return $str;
 }
 
 sub get_inchikey {
-	return `$babel -i xyz $xyz -o inchikey -  2> /dev/null | head -1`;
+	my $ret = `$babel -i xyz '$input' -o inchikey -  2> /dev/null | head -1`;
+	chomp $ret;
+	return $ret;
 
 }
 sub do_arg_parse {
 
 for( my $i=0; $i < scalar(@ARGV); $i++ ) {
-	if( $i eq "-h" || $i eq "--help" ) { do_syntax(); }
-	if( $i eq "--input"  ) { $input  = $ARGV[$i+1]; $i++; }		
-	if( $i eq "--output" ) { $output = $ARGV[$i+1]; $i++; }		
-	if( $i eq "--code"   ) { $code   = $ARGV[$i+1]; $i++; }		
-	if( $i eq "--theory" ) { $theory = $ARGV[$i+1]; $i++; }		
-	if( $i eq "--opt" )    { $opt    = 1; }		
-	if( $i eq "--basis" )  { $basis  = $ARGV[$i+1]; $i++; }		
-	if( $i eq "--grid" )   { $grid   = $ARGV[$i+1]; $i++; }		
-	if( $i eq "--frozen" ) { $frozen = $ARGV[$i+1]; $i++; }		
-	if( $i eq "--ncpus"  ) { $ncpus  = $ARGV[$i+1]; $i++; }		
-	if( $i eq "--mem"   )  { $mem    = $ARGV[$i+1]; $i++; }		
-	if( $i eq "--cache" )  { $cache  = 1; }
+	if( $ARGV[$i] eq "-h" || $ARGV[$i] eq "--help" ) { do_syntax(); }
+	elsif( $ARGV[$i] eq "--input"  ) { $input  = $ARGV[$i+1]; $i++; }		
+	elsif( $ARGV[$i] eq "--output" ) { $output = $ARGV[$i+1]; $i++; }		
+	elsif( $ARGV[$i] eq "--code"   ) { 
+		$code   = $ARGV[$i+1]; $i++; 
+		if( !exists( ${$codes}{$code} ) ) {
+			error( "Code $code not found\n" );
+		}
+	}		
+	elsif( $ARGV[$i] eq "--theory" ) { $theory = $ARGV[$i+1]; $i++; }		
+	elsif( $ARGV[$i] eq "--mult"   ) { $mult   = int($ARGV[$i+1]); $i++; }		
+	elsif( $ARGV[$i] eq "--charge" ) { $charge = int($ARGV[$i+1]); $i++; }		
+	elsif( $ARGV[$i] eq "--opt"    ) { $opt    = 1; }		
+	elsif( $ARGV[$i] eq "--basis" )  { $basis  = $ARGV[$i+1]; $i++; }		
+	elsif( $ARGV[$i] eq "--grid" )   { $grid   = $ARGV[$i+1]; $i++; }		
+	elsif( $ARGV[$i] eq "--frozen" ) { $frozen = $ARGV[$i+1]; $i++; }		
+	elsif( $ARGV[$i] eq "--ncpus"  ) { $ncpus  = $ARGV[$i+1]; $i++; }		
+	elsif( $ARGV[$i] eq "--mem"   )  { $mem    = $ARGV[$i+1]; $i++; }		
+	elsif( $ARGV[$i] eq "--cache" )  { $cache  = 1; }
+	elsif( $ARGV[$i] eq "--verbose" ){ $verbose= 1; }
 	else {
-			print "Unknown argument $i\n\n";
+			print "Unknown argument $ARGV[$i]: --help for syntax\n\n";
 			exit(1);
 	}
 }
@@ -161,12 +209,15 @@ for( my $i=0; $i < scalar(@ARGV); $i++ ) {
 sub do_syntax {
 	print "
   Options:
-    --input  [file]     Input molecule in XYZ format     (default $xyz)
+    --input  [file]     Input molecule in XYZ format     (default $input)
+    --output [file]     Output conformation in XYZ format(default $output)
     --code   arg1       QM code to use: gaussian, psi4   (default $code)
     --theory arg1       Theory level: b3lyp, rhf, uhf    (default $theory)   
     --opt               Specify to optimise, otherwise single-point               
     --basis  arg1       Basis set: 6-31g*, cc-pvdz       (default $basis)
     --grid   [file]     List of grid points to evaluate  (default [none])
+    --mult   #          Multiplicity                     (default 1)
+    --charge #          Formal charge on the molecule    (default 0)
     --frozen arg1       List of bonds, angle, dihedrals to freeze
                           Atoms indexed from 1, comma-separated.
                           Each term colon-separated.
@@ -174,9 +225,46 @@ sub do_syntax {
                             --frozen 1,2,3:3,5,6,7
     --ncpus #           # of CPUS to use                 (default $ncpus)
     --mem   #           GB of memory to use              (default 2)
-    --cache             Specify to check for cached result
-   
 ";
 	exit 0;
 }
+
+
+sub error {
+	my $msg = shift;
+	print "Error: $msg\n";
+	exit 1;
+}
+
+sub find_bin {
+	my $x = shift;
+	my $ret=`which $x 2> /dev/null`;
+	chomp($ret);
+	if( -x $ret ) { return $ret; }
+	return undef;
+}
+
+sub run_psi4 {
+	`${$codes}{psi4} -i input.dat -o output.dat`;
+	cp( "psi4.xyz", "output.xyz" );		
+}
+sub run_gaussian {
+#	`${$codes}{gaussian} < input.dat > output.dat`;
+	my $cmd = "$babel -i g09 output.dat -o xyz - 2> /dev/null"; 
+#	$ee /= 627.509469; # KCal to Hartree
+	my @ret= `$cmd `;
+	
+	my $ee = $ret[1];
+	chomp($ee);
+	$ee =~ s/^.*\s//g;
+	$ee /=  627.509469; # convert kcal to hartree
+	chomp($ret[0]);
+	$ret[0] = $ret[0] . " $ee\n";
+
+	open( my $f, ">", "output.xyz" ) or die "Can't open output.xyz" ;
+	print $f @ret;
+	close($f);
+	# Get the qm energy, stuff it into an xyz of the opt geometry
+}
+
 
